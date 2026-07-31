@@ -1,6 +1,13 @@
 # IK_EM_Capstone_TalentSphere-AI
 IK EM Capstone project - Enterprise Multi-Agent Recruitment Intelligence Platform built using n8n, OpenAI GPT-4o-mini, Pinecone and Streamlit.
 
+Built with
+• n8n Cloud
+• OpenAI GPT-4o-mini
+• Pinecone
+• Streamlit
+• Google Drive
+
 Features
 Multi-Agent AI Architecture
 Routing Agent
@@ -23,37 +30,12 @@ Streamlit
 
 Workflow
 
-Hiring Data
-↓
-Validation
-↓
-Routing
-↓
-4 AI Agents
-↓
-Panel Load Balancer
-↓
-Aggregation
-↓
-Validation
-↓
-Evaluation
-↓
-Human Review
-↓
-Dashboard
+Hiring Data -> Validation -> Routing -> 4 AI Agents -> Panel Load Balancer (deterministic - no LLM) -> Aggregation -> Validation -> Evaluation ->Human Review -> Dashboard
 
 Key Capabilities
-
-Retrieval-Augmented Generation (RAG)
-Grounded AI
-Structured JSON Output
-Evaluation
-Cost Tracking
-Production Observability
-
-Repository
-workflow/
-docs/
-data/
-screenshots/
+• Retrieval-Augmented Generation (RAG)
+• Grounded AI
+• Structured JSON Output
+• Evaluation
+• Cost Tracking
+• Production Observability
