@@ -1,0 +1,33 @@
+End-to-End flow
+
+HTTP Test Trigger
+        ↓
+Input Validation and Normalization
+        ↓
+Routing Agent
+        ↓
+Selected Specialized Agents
+        ↓
+Pinecone RAG for Four Insight Agents
+        ↓
+GPT-4o-mini Grounded Reasoning
+        +
+Deterministic Panel Load Balancer
+        ↓
+Shared JSON Output Contract
+        ↓
+Aggregate Agent
+        ↓
+JSON Validation
+        ↓
+JSON Repair when required
+        ↓
+LLM-as-a-Judge Evaluation
+        ↓
+Deterministic Quality Gate
+        ↓
+Publish or Human Review
+        ↓
+Observability
+        ↓
+HTTP Response and Streamlit Dashboard
