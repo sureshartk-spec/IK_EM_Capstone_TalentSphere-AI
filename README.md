@@ -22,6 +22,13 @@ Features
 • Observability
 • Streamlit Dashboard
 
+Key Architectural decisions: 
+• LLMs interpret unstructured information and generate grounded recommendations.
+• Deterministic logic performs calculations such as interviewer workload balancing.
+• Validation ensures outputs follow a consistent schema.
+• Evaluation independently assesses recommendation quality.
+• Human review preserves accountability. 
+
 Workflow
 Hiring Data -> Validation -> Routing -> 4 AI Agents -> Panel Load Balancer (deterministic - no LLM) -> Aggregation -> Validation -> Evaluation ->Human Review -> Dashboard
 
