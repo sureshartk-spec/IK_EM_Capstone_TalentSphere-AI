@@ -1,0 +1,1051 @@
+{
+  "name": "TalentSphere AI — End-to-End v6 Fixed Conditional Routing",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "talentsphere-ai-capstone",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "864e0315-98e1-46e3-9f48-0fbc940dae2e",
+      "name": "1. Streamlit Intake / Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -928,
+        368
+      ],
+      "notesInFlow": true,
+      "webhookId": "043e27dc-858f-4b5e-9a66-82e42d3f514a",
+      "notes": "TA/Recruiter uploads CSV through Streamlit and starts analysis. Hiring Manager may optionally request analysis."
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst body = $json.body ?? $json;\nconst runId = body.run_id || `TS-${Date.now()}`;\nconst records = Array.isArray(body.records) ? body.records : [];\n\nreturn [{\n  json: {\n    run_id: runId,\n    started_at: new Date().toISOString(),\n    requested_by: body.requested_by || \"ta.recruiter@example.com\",\n    requester_role: body.requester_role || \"TA/Recruiter\",\n    role_filter: body.role_filter || \"Data Engineer\",\n    analysis_period: body.analysis_period || \"Uploaded dataset\",\n    requested_agents: body.requested_agents || [\n      \"sourcing_quality\",\n      \"rejection_pattern\",\n      \"offer_insights\",\n      \"pipeline_health\",\n      \"panel_load_balancer\"\n    ],\n    human_decision: body.human_decision || null,\n    human_comment: body.human_comment || null,\n    records,\n    observability: [{\n      component: \"streamlit_intake\",\n      event: \"RUN_STARTED\",\n      status: \"SUCCESS\",\n      timestamp: new Date().toISOString()\n    }]\n  }\n}];\n"
+      },
+      "id": "fa31ad4c-98d5-47ef-b76d-50e124b6bd73",
+      "name": "2. Hiring Data Sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -704,
+        368
+      ],
+      "notesInFlow": true,
+      "notes": "Receives CSV/Mock ATS/Interview and Offer records converted to JSON by Streamlit."
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst required = [\"candidate_id\",\"role\",\"source\",\"stage\"];\nconst valid = [];\nconst quarantined = [];\nconst seen = new Set();\n\nfor (const [index, raw] of ($json.records || []).entries()) {\n  const r = {...raw};\n\n  r.candidate_id = String(r.candidate_id ?? \"\").trim();\n  r.role = String(r.role ?? \"\").trim();\n  r.source = String(r.source ?? \"\").trim()\n    .replace(/^Linked In$/i, \"LinkedIn\")\n    .replace(/^Referral$/i, \"Employee Referral\");\n  r.stage = String(r.stage ?? \"\").trim();\n\n  if (r.offer_status) {\n    const s = String(r.offer_status).trim().toLowerCase();\n    r.offer_status = s.includes(\"accept\") ? \"Accepted\" :\n                     s.includes(\"declin\") ? \"Declined\" : r.offer_status;\n  }\n\n  for (const k of [\"offer_amount\",\"days_to_decision\",\"interview_hours\",\"agency_fee_pct\",\"quality_of_hire_score\"]) {\n    if (r[k] !== null && r[k] !== undefined && r[k] !== \"\") {\n      const value = Number(r[k]);\n      r[k] = Number.isFinite(value) ? value : r[k];\n    }\n  }\n\n  const missing = required.filter(k => !r[k]);\n  let error = null;\n  if (missing.length) error = `Missing required fields: ${missing.join(\", \")}`;\n  else if (seen.has(r.candidate_id)) error = \"Duplicate candidate_id\";\n  else if (r.offer_amount !== \"\" && r.offer_amount !== null && r.offer_amount !== undefined && !Number.isFinite(Number(r.offer_amount))) {\n    error = \"Invalid offer_amount\";\n  }\n\n  if (error) quarantined.push({row_number:index+2, reason:error, record:raw});\n  else {\n    seen.add(r.candidate_id);\n    if (!r.role || r.role === $json.role_filter) valid.push(r);\n  }\n}\n\nif (!valid.length) {\n  throw new Error(\"No valid records remain after validation and role filtering.\");\n}\n\nreturn [{\n  json: {\n    ...$json,\n    records: valid,\n    ingestion: {\n      status: quarantined.length ? \"PASSED_WITH_WARNINGS\" : \"PASSED\",\n      received_records: ($json.records || []).length,\n      valid_records: valid.length,\n      quarantined_records: quarantined.length,\n      quarantined\n    },\n    observability: [\n      ...$json.observability,\n      {\n        component:\"ingest_validate_clean\",\n        event:\"COMPLETED\",\n        status:quarantined.length ? \"PASSED_WITH_WARNINGS\" : \"SUCCESS\",\n        valid_records:valid.length,\n        quarantined_records:quarantined.length,\n        timestamp:new Date().toISOString()\n      }\n    ]\n  }\n}];\n"
+      },
+      "id": "4197fe33-3d27-4e64-a0e6-fdf36e9c4797",
+      "name": "3. Ingest, Validate & Clean",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -480,
+        368
+      ],
+      "notesInFlow": true,
+      "notes": "Schema checks, normalization, duplicate handling, invalid-row quarantine, and role filtering."
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst fields = new Set(Object.keys($json.records[0] || {}));\nconst requested = new Set($json.requested_agents || []);\nconst defs = {\n  sourcing_quality: {required:[\"source\",\"stage\"], uses_rag:true},\n  rejection_pattern: {required:[\"rejection_reason\",\"stage\"], uses_rag:true},\n  offer_insights: {required:[\"offer_status\",\"offer_amount\",\"days_to_decision\"], uses_rag:true},\n  pipeline_health: {required:[\"stage\",\"stage_entry_date\"], uses_rag:true},\n  panel_load_balancer: {required:[\"interviewer\",\"interview_hours\"], uses_rag:false}\n};\n\nconst selected = [];\nconst skipped = [];\n\nfor (const [agent, def] of Object.entries(defs)) {\n  const missing = def.required.filter(f => !fields.has(f));\n  if (!requested.has(agent)) skipped.push({agent, reason:\"Not requested\"});\n  else if (missing.length) skipped.push({agent, reason:`Missing fields: ${missing.join(\", \")}`});\n  else selected.push(agent);\n}\n\nif (!selected.length) throw new Error(\"Routing Agent found no executable agents.\");\n\nreturn [{\n  json:{\n    ...$json,\n    routing:{\n      selected_agents:selected,\n      skipped_agents:skipped,\n      execution_mode:\"PARALLEL\",\n      four_grounded_agents:selected.filter(a=>a!==\"panel_load_balancer\"),\n      deterministic_agents:selected.filter(a=>a===\"panel_load_balancer\")\n    },\n    observability:[\n      ...$json.observability,\n      {\n        component:\"routing_agent\",\n        event:\"AGENTS_SELECTED\",\n        status:\"SUCCESS\",\n        selected_agents:selected,\n        skipped_agents:skipped,\n        timestamp:new Date().toISOString()\n      }\n    ]\n  }\n}];\n"
+      },
+      "id": "09000cba-6d59-4b72-90b4-e1d586819257",
+      "name": "4. Routing Agent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -256,
+        368
+      ],
+      "notesInFlow": true,
+      "notes": "Selects applicable agents based on requested analysis and required fields."
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst selected = $json.routing?.selected_agents || [];\nif (!selected.includes(\"sourcing_quality\")) return [];\n\nreturn [{\n  json:{\n    ...$json,\n    active_agent:\"sourcing_quality\",\n    agent_task:{\n      agent:\"sourcing_quality\",\n      purpose:\"Analyze source conversion, quality, speed, and cost.\",\n      task_id:`${$json.run_id}-sourcing_quality`,\n      uses_rag:true,\n      requested_at:new Date().toISOString()\n    },\n    observability:[\n      ...$json.observability,\n      {component:\"sourcing_quality\", event:\"AGENT_STARTED\", status:\"RUNNING\", timestamp:new Date().toISOString()}\n    ]\n  }\n}];\n"
+      },
+      "id": "c7c0b674-2fb2-42d1-81a1-ef8d105abdfe",
+      "name": "5A. Sourcing Quality Agent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "notesInFlow": true,
+      "notes": "Explicit architecture agent. Sends a grounded analysis request to Shared RAG."
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst selected = $json.routing?.selected_agents || [];\nif (!selected.includes(\"rejection_pattern\")) return [];\n\nreturn [{\n  json:{\n    ...$json,\n    active_agent:\"rejection_pattern\",\n    agent_task:{\n      agent:\"rejection_pattern\",\n      purpose:\"Identify repeated rejection patterns and governance concerns.\",\n      task_id:`${$json.run_id}-rejection_pattern`,\n      uses_rag:true,\n      requested_at:new Date().toISOString()\n    },\n    observability:[\n      ...$json.observability,\n      {component:\"rejection_pattern\", event:\"AGENT_STARTED\", status:\"RUNNING\", timestamp:new Date().toISOString()}\n    ]\n  }\n}];\n"
+      },
+      "id": "f0c6046d-12bc-41e6-8fd4-62cbb7092ae3",
+      "name": "5B. Rejection Pattern Agent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        160
+      ],
+      "notesInFlow": true,
+      "notes": "Explicit architecture agent. Sends a grounded analysis request to Shared RAG."
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst selected = $json.routing?.selected_agents || [];\nif (!selected.includes(\"offer_insights\")) return [];\n\nreturn [{\n  json:{\n    ...$json,\n    active_agent:\"offer_insights\",\n    agent_task:{\n      agent:\"offer_insights\",\n      purpose:\"Analyze acceptance, compensation-band alignment, and decision delays.\",\n      task_id:`${$json.run_id}-offer_insights`,\n      uses_rag:true,\n      requested_at:new Date().toISOString()\n    },\n    observability:[\n      ...$json.observability,\n      {component:\"offer_insights\", event:\"AGENT_STARTED\", status:\"RUNNING\", timestamp:new Date().toISOString()}\n    ]\n  }\n}];\n"
+      },
+      "id": "abde21e2-d38b-41b1-9a48-3e75a1c4c0a0",
+      "name": "5C. Offer Insights Agent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        320
+      ],
+      "notesInFlow": true,
+      "notes": "Explicit architecture agent. Sends a grounded analysis request to Shared RAG."
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst selected = $json.routing?.selected_agents || [];\nif (!selected.includes(\"pipeline_health\")) return [];\n\nreturn [{\n  json:{\n    ...$json,\n    active_agent:\"pipeline_health\",\n    agent_task:{\n      agent:\"pipeline_health\",\n      purpose:\"Analyze stage distribution, aging, bottlenecks, and SLA risks.\",\n      task_id:`${$json.run_id}-pipeline_health`,\n      uses_rag:true,\n      requested_at:new Date().toISOString()\n    },\n    observability:[\n      ...$json.observability,\n      {component:\"pipeline_health\", event:\"AGENT_STARTED\", status:\"RUNNING\", timestamp:new Date().toISOString()}\n    ]\n  }\n}];\n"
+      },
+      "id": "7355455b-1a9e-4729-bb8e-c3ce62779c95",
+      "name": "5D. Pipeline Health Agent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        480
+      ],
+      "notesInFlow": true,
+      "notes": "Explicit architecture agent. Sends a grounded analysis request to Shared RAG."
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst selected = $json.routing?.selected_agents || [];\nif (!selected.includes(\"panel_load_balancer\")) return [];\n\nconst loads = {};\nfor (const r of $json.records) {\n  const person = r.interviewer;\n  if (!person) continue;\n  loads[person] = (loads[person] || 0) + Number(r.interview_hours || 0);\n}\n\nconst metrics = Object.entries(loads)\n  .map(([interviewer, hours]) => ({interviewer, hours}))\n  .sort((a, b) => b.hours - a.hours);\n\nconst high = metrics[0];\nconst low = metrics[metrics.length - 1];\n\nconst recommendation = high && low && high.interviewer !== low.interviewer\n  ? `Review moving one suitable interview block from ${high.interviewer} to ${low.interviewer}, subject to skill and availability checks.`\n  : \"Panel workload is balanced or insufficient data is available.\";\n\nreturn [{\n  json: {\n    ...$json,\n    active_agent: \"panel_load_balancer\",\n    deterministic_reasoning: {\n      model: \"DETERMINISTIC_NO_RAG_NO_LLM\",\n      prompt_version: null,\n      metrics,\n      recommendation,\n      reasoning: \"Calculated directly from structured interviewer workload data. No RAG or reasoning LLM was used.\",\n      confidence: metrics.length ? 0.95 : 0.50,\n      limitations: [\n        \"Skill fit and actual calendar availability must be verified before reassignment.\"\n      ],\n      requires_human_review: true,\n      human_review_reason: \"Panel assignments affect people and schedules and require an authorized coordinator or manager.\",\n      evidence: [\n        {\n          statement: \"Workload hours were calculated from the uploaded interviewer data.\",\n          source: \"Hiring dataset\",\n          title: \"Uploaded panel workload data\"\n        }\n      ],\n      cost_of_insight: {\n        input_tokens: 0,\n        output_tokens: 0,\n        latency_ms: 80,\n        estimated_cost_usd: 0\n      },\n      generated_at: new Date().toISOString()\n    },\n    observability: [\n      ...$json.observability,\n      {\n        component: \"panel_load_balancer\",\n        event: \"DIRECT_CALCULATION_COMPLETED\",\n        status: \"SUCCESS\",\n        model: \"DETERMINISTIC_NO_RAG_NO_LLM\",\n        latency_ms: 80,\n        input_tokens: 0,\n        output_tokens: 0,\n        estimated_cost_usd: 0,\n        timestamp: new Date().toISOString()\n      }\n    ]\n  }\n}];\n"
+      },
+      "id": "1fcdfd54-c647-47aa-9a5c-87e6339be499",
+      "name": "5E. Panel Load Balancer — Direct Execution",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        672
+      ],
+      "notesInFlow": true,
+      "notes": "Fifth agent. Executes deterministic workload logic, bypasses Shared RAG and Shared LLM, then passes through the common Standardized Agent JSON Output node."
+    },
+    {
+      "parameters": {
+        "numberInputs": 4
+      },
+      "id": "cd8bf5c4-bd2d-4f3d-858f-c68a6e07df7d",
+      "name": "5F. Merge Four Grounded Agent Requests",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        272,
+        288
+      ],
+      "notesInFlow": true,
+      "notes": "Technical orchestration node: combines the four explicit grounded-agent requests into one Shared RAG service."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const documents = ($json.retrieval?.documents || []).map((document, index) => ({\n  rank: index + 1,\n  source_id: document.source_id,\n  title: document.title,\n  score: document.score,\n  statement: document.statement,\n}));\n\nif (documents.length === 0) {\n  throw new Error(\n    `No Pinecone evidence is available for agent: ${$json.active_agent}`\n  );\n}\n\nconst agentInstructions = {\n  sourcing_quality:\n    \"Analyze source conversion, quality, speed, and cost. Preserve source diversity and avoid overgeneralizing from small samples.\",\n\n  rejection_pattern:\n    \"Identify repeated rejection patterns, inconsistent reason capture, and governance concerns. Do not infer protected characteristics.\",\n\n  offer_insights:\n    \"Analyze offer acceptance, compensation alignment, and decision delays. Treat compensation recommendations as requiring authorized human approval.\",\n\n  pipeline_health:\n    \"Analyze stage distribution, aging, bottlenecks, and SLA risk. Distinguish operational delays from candidate quality.\",\n};\n\nconst task =\n  agentInstructions[$json.active_agent] ||\n  $json.agent_task?.purpose ||\n  \"Analyze the supplied hiring records using the retrieved policy evidence.\";\n\nconst requestStartedAt = Date.now();\n\nconst promptPayload = {\n  task,\n  active_agent: $json.active_agent,\n  role_filter: $json.role_filter,\n  analysis_period: $json.analysis_period,\n  hiring_records: $json.records,\n  retrieved_policy_evidence: documents,\n\n  required_output: {\n    metrics: {},\n    recommendation: \"Specific actionable recommendation\",\n    reasoning: \"Concise explanation grounded in the supplied evidence\",\n    confidence: 0.8,\n    limitations: [\"At least one material limitation\"],\n    requires_human_review: false,\n    human_review_reason: \"\",\n  },\n};\n\nreturn {\n  json: {\n    ...$json,\n\n    openai_reasoning_started_at_ms: requestStartedAt,\n\n    openai_request: {\n      model: \"gpt-4o-mini\",\n      store: false,\n      max_output_tokens: 1800,\n\n      instructions:\n        \"You are the Shared Reasoning LLM for TalentSphere AI. \" +\n        \"Use only the supplied hiring records and Pinecone policy evidence. \" +\n        \"Never invent policies, metrics, facts, or citations. \" +\n        \"Return exactly one valid JSON object. \" +\n        \"Do not include Markdown, commentary, or code fences.\",\n\n      input: JSON.stringify(promptPayload),\n    },\n  },\n};"
+      },
+      "id": "2506591f-2d19-4c1a-979a-9a8d47d5dd91",
+      "name": "7A. Build Grounded Reasoning Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1168,
+        288
+      ],
+      "notesInFlow": true,
+      "notes": "Builds the grounded GPT-4o-mini request using uploaded hiring records and Pinecone-retrieved policy context."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\nconst r = $json.llm_reasoning || $json.deterministic_reasoning;\n\nif (!r) {\n  throw new Error(`No reasoning payload found for agent ${$json.active_agent || \"unknown\"}.`);\n}\n\nconst isDeterministic = Boolean($json.deterministic_reasoning);\nconst retrievedEvidence = ($json.retrieval?.documents || []).map(d => ({\n  statement: d.statement,\n  source: d.source_id,\n  title: d.title\n}));\n\nconst evidence = isDeterministic\n  ? (r.evidence || [])\n  : retrievedEvidence;\n\nconst defaultCost = isDeterministic\n  ? {input_tokens:0, cached_input_tokens:0, output_tokens:0, total_tokens:0, latency_ms:80, estimated_cost_usd:0}\n  : {input_tokens:0, cached_input_tokens:0, output_tokens:0, total_tokens:0, latency_ms:0, estimated_cost_usd:0};\n\nreturn {\n  json: {\n    ...$json,\n    agent_result: {\n      agent: $json.active_agent,\n      status: \"SUCCESS\",\n      recommendation: r.recommendation,\n      reasoning: r.reasoning,\n      metrics: r.metrics,\n      evidence,\n      confidence_score: r.confidence,\n      cost_of_insight: r.cost_of_insight || defaultCost,\n      alternative: isDeterministic\n        ? \"Retain the current schedule and review workload again after the next interview cycle.\"\n        : \"Collect an additional reporting period and rerun before making a major policy change.\",\n      limitations: r.limitations || [],\n      requires_human_review: Boolean(r.requires_human_review),\n      human_review_reason: r.human_review_reason || \"\"\n    },\n    observability: [\n      ...($json.observability || []),\n      {\n        component: $json.active_agent,\n        event: \"STANDARD_JSON_CREATED\",\n        status: \"SUCCESS\",\n        output_contract: \"TalentSphereAgentOutputV1\",\n        timestamp: new Date().toISOString()\n      }\n    ]\n  }\n};"
+      },
+      "id": "0ef476c7-f6be-4aa0-b6da-c2576ff22f09",
+      "name": "8. Standardized Agent JSON Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        384
+      ],
+      "notesInFlow": true,
+      "notes": "Common formatter for all five agents. Both grounded LLM outputs and the deterministic Panel Load Balancer output must pass through this node before aggregation."
+    },
+    {
+      "parameters": {
+        "numberInputs": 5
+      },
+      "id": "e583e919-14fc-4b97-b276-8bf751e0aad5",
+      "name": "7D. Merge Four Grounded + One Direct Agent",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        1840,
+        384
+      ],
+      "notesInFlow": true,
+      "notes": "Combines four Shared-LLM agent responses with the direct Panel Load Balancer response before the common standardization step."
+    },
+    {
+      "parameters": {
+        "jsCode": "const inputItems = $input.all();\nif (!inputItems.length) throw new Error(\"Aggregate Agent received no standardized agent outputs.\");\nconst base = inputItems[0].json;\nconst agentResults = inputItems.map(i => i.json.agent_result).filter(r => r && r.agent);\nconst completed = agentResults.map(r => r.agent);\nconst expected = base.routing?.selected_agents || base.requested_agents || [];\nconst missing = expected.filter(a => !completed.includes(a));\nconst duplicates = completed.filter((a,i,arr) => arr.indexOf(a) !== i);\nconst complete = agentResults.length === expected.length && !missing.length && !duplicates.length;\nconst mergedObs = inputItems.flatMap(i => i.json.observability || []);\nreturn [{json:{\n  ...base,\n  agent_results:agentResults,\n  aggregate:{\n    status:complete?\"SUCCESS\":\"PARTIAL_SUCCESS\",\n    expected_agents:expected.length,\n    completed_agents:agentResults.length,\n    expected_agent_names:expected,\n    completed_agent_names:completed,\n    missing_agents:missing,\n    duplicate_agents:duplicates,\n    partial_success:!complete,\n    aggregated_at:new Date().toISOString()\n  },\n  observability:[...mergedObs,{\n    component:\"aggregate_agent\",event:\"AGGREGATION_COMPLETED\",\n    status:complete?\"SUCCESS\":\"PARTIAL_SUCCESS\",\n    expected_agents:expected.length,completed_agents:agentResults.length,\n    missing_agents:missing,duplicate_agents:duplicates,\n    timestamp:new Date().toISOString()\n  }]\n}}];"
+      },
+      "id": "7d0d50b6-092c-45e9-ac76-32d73d4b59f6",
+      "name": "9. Aggregate Agent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2320,
+        384
+      ],
+      "notesInFlow": true,
+      "notes": "Combines completed outputs without redoing agent reasoning. Supports partial results."
+    },
+    {
+      "parameters": {
+        "jsCode": "const results = Array.isArray($json.agent_results) ? $json.agent_results : [];\nconst required=[\"agent\",\"status\",\"recommendation\",\"reasoning\",\"metrics\",\"evidence\",\"confidence_score\",\"cost_of_insight\",\"alternative\",\"limitations\",\"requires_human_review\"];\nconst checks=results.map(r=>{\n  const missing=required.filter(k=>r[k]===undefined||r[k]===null);\n  const confidenceValid=typeof r.confidence_score===\"number\"&&r.confidence_score>=0&&r.confidence_score<=1;\n  const evidenceValid=Array.isArray(r.evidence);\n  const limitationsValid=Array.isArray(r.limitations);\n  const costValid=r.cost_of_insight&&typeof r.cost_of_insight===\"object\"&&!Array.isArray(r.cost_of_insight);\n  return {agent:r.agent||\"unknown\",valid:!missing.length&&confidenceValid&&evidenceValid&&limitationsValid&&costValid,missing,confidence_valid:confidenceValid,evidence_valid:evidenceValid,limitations_valid:limitationsValid,cost_valid:costValid};\n});\nconst expected=Number($json.aggregate?.expected_agents||0);\nconst countValid=expected>0&&results.length===expected&&$json.aggregate?.partial_success===false;\nconst valid=results.length>0&&checks.every(c=>c.valid)&&countValid;\nreturn [{json:{...$json,json_validation:{valid,status:valid?\"PASSED\":\"FAILED\",expected_agent_count:expected,received_agent_count:results.length,result_count_valid:countValid,checks,repair_attempts:0},observability:[...($json.observability||[]),{component:\"json_validation\",event:\"VALIDATION_COMPLETED\",status:valid?\"SUCCESS\":\"FAILED\",timestamp:new Date().toISOString()}]}}];"
+      },
+      "id": "002757e6-76b1-44bd-b481-e503ab11b7dc",
+      "name": "10. JSON Validation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2544,
+        384
+      ],
+      "notesInFlow": true,
+      "notes": "Validates every agent result against the shared output contract."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cc4ec23b-8d95-4327-acb0-16672524bbbb",
+              "leftValue": "={{ $json.json_validation.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b5c15ffe-dc4c-453e-ac8d-c63c1c22bb6d",
+      "name": "Valid Shared JSON Contract?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2768,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst requiredDefaults={\n  recommendation:\"No recommendation produced.\",\n  evidence:[],\n  confidence_score:0.30,\n  cost_of_insight:{input_tokens:0,output_tokens:0,latency_ms:0,estimated_cost_usd:0},\n  alternative:\"Route to human review.\",\n  limitations:[\"Output required schema repair.\"],\n  requires_human_review:true\n};\nconst repaired=$json.agent_results.map(r=>({...requiredDefaults,...r}));\nreturn [{\n  json:{\n    ...$json,\n    agent_results:repaired,\n    json_validation:{\n      ...$json.json_validation,\n      repair_attempts:1,\n      repair_status:\"ATTEMPTED\"\n    },\n    observability:[\n      ...$json.observability,\n      {component:\"json_repair\",event:\"REPAIR_ATTEMPTED\",status:\"SUCCESS\",timestamp:new Date().toISOString()}\n    ]\n  }\n}];\n"
+      },
+      "id": "047cab88-ccd9-4d41-ba79-0790b58d778b",
+      "name": "10A. JSON Repair — One Attempt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2768,
+        576
+      ],
+      "notesInFlow": true,
+      "notes": "Adds safe defaults for missing contract fields and forces human review."
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst required=[\"agent\",\"status\",\"recommendation\",\"evidence\",\"confidence_score\",\"cost_of_insight\",\"alternative\",\"limitations\",\"requires_human_review\"];\nconst checks=$json.agent_results.map(r=>({agent:r.agent,valid:required.every(k=>r[k]!==undefined&&r[k]!==null)}));\nreturn [{\n  json:{\n    ...$json,\n    json_validation:{\n      ...$json.json_validation,\n      valid:checks.every(c=>c.valid),\n      status:checks.every(c=>c.valid)?\"PASSED_AFTER_REPAIR\":\"FAILED_AFTER_REPAIR\",\n      checks\n    },\n    observability:[\n      ...$json.observability,\n      {component:\"json_validation\",event:\"REVALIDATION_COMPLETED\",status:checks.every(c=>c.valid)?\"SUCCESS\":\"FAILED\",timestamp:new Date().toISOString()}\n    ]\n  }\n}];\n"
+      },
+      "id": "c0057d9f-12a9-48f9-8b88-05568c77ad9f",
+      "name": "10B. Revalidate Repaired JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2992,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const requestStartedAt = Date.now();\n\nconst compactResults = ($json.agent_results || []).map(result => ({\n  agent: result.agent,\n  recommendation: result.recommendation,\n  reasoning: result.reasoning,\n  metrics: result.metrics,\n  evidence: result.evidence,\n  confidence_score: result.confidence_score,\n  limitations: result.limitations,\n  requires_human_review: result.requires_human_review\n}));\n\nconst evaluationPayload = {\n  evaluation_criteria: {\n    grounding_score:\n      \"Number from 0 to 1. High only when claims are supported by supplied evidence.\",\n    actionability_score:\n      \"Number from 0 to 1. High when the recommendation is specific and operationally useful.\",\n    hallucination_risk:\n      \"Number from 0 to 1. Lower is better.\",\n    safety_score:\n      \"Number from 0 to 1. Reflects governance and human-review safeguards.\",\n    decision:\n      \"One of PASS, PASS_WITH_HUMAN_REVIEW, REVISE, or FAIL.\"\n  },\n  required_output: {\n    results: [\n      {\n        agent: \"agent name\",\n        grounding_score: 0,\n        actionability_score: 0,\n        hallucination_risk: 0,\n        safety_score: 0,\n        decision: \"PASS\",\n        rationale: \"brief explanation\"\n      }\n    ],\n    overall_summary: \"brief overall assessment\"\n  },\n  json_validation: $json.json_validation,\n  aggregate: $json.aggregate,\n  agent_results: compactResults\n};\n\nreturn [{\n  json: {\n    ...$json,\n    openai_evaluation_started_at_ms: requestStartedAt,\n    openai_evaluation_request: {\n      model: \"gpt-4o-mini\",\n      store: false,\n      max_output_tokens: 1600,\n      instructions:\n        \"You are an independent LLM-as-a-Judge for TalentSphere AI. \" +\n        \"Evaluate each agent result strictly against its supplied evidence. \" +\n        \"Do not add facts or policies. \" +\n        \"Return exactly one valid JSON object without Markdown or code fences.\",\n      input: JSON.stringify(evaluationPayload)\n    }\n  }\n}];"
+      },
+      "id": "42c1e354-dcdf-491d-9e5a-76e25d93bae8",
+      "name": "11A. Build Evaluation Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3216,
+        384
+      ],
+      "notesInFlow": true,
+      "notes": "Builds a GPT-4o-mini evaluation request. It receives either the original validated output or the repaired-and-revalidated output directly, without waiting on a mutually exclusive Merge branch."
+    },
+    {
+      "parameters": {
+        "jsCode": "const validationPassed=$json.json_validation?.valid===true;\nconst aggregateComplete=$json.aggregate?.partial_success===false;\nconst evaluations=$json.evaluation?.agent_evaluations||$json.evaluation?.results||[];\nconst failed=evaluations.filter(e=>e.decision===\"REVISE\"||e.decision===\"FAIL\");\nconst review=new Set(($json.agent_results||[]).filter(r=>r.requires_human_review).map(r=>r.agent));\nfor(const e of evaluations) if(e.decision===\"PASS_WITH_HUMAN_REVIEW\") review.add(e.agent);\nif(!validationPassed||!aggregateComplete) for(const r of ($json.agent_results||[])) review.add(r.agent);\nconst met=validationPassed&&aggregateComplete&&!failed.length;\nreturn [{json:{...$json,quality_gate:{quality_threshold_met:met,validation_passed:validationPassed,aggregate_complete:aggregateComplete,failed_evaluations:failed.map(e=>e.agent),requires_human_review:review.size>0,review_agents:[...review],reason:!validationPassed?\"JSON validation failed.\":!aggregateComplete?\"Not all expected agents completed successfully.\":failed.length?\"One or more evaluations require revision.\":review.size?\"Policy-sensitive outputs require authorized human review.\":\"All quality thresholds passed.\"}}}];"
+      },
+      "id": "9883725a-eef0-46e6-8028-f3e35725691a",
+      "name": "12. Quality Threshold Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3888,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0e6ce9aa-812b-4c65-89e0-38f373c6289d",
+              "leftValue": "={{ $json.quality_gate.requires_human_review }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7b6c58f3-07d3-4384-8d35-196a6a8a667e",
+      "name": "Human Review Required?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4112,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d=String($json.human_decision||\"\").trim().toUpperCase();\nconst allowed=[\"APPROVED\",\"APPROVED_WITH_CONDITIONS\",\"REJECTED\",\"REVISION_REQUESTED\"];\nconst approved=[\"APPROVED\",\"APPROVED_WITH_CONDITIONS\"];\nconst qualityReady=$json.quality_gate?.quality_threshold_met===true&&$json.aggregate?.partial_success===false&&$json.json_validation?.valid===true;\nlet review;\nif(!d) review={required:true,status:\"AWAITING_HUMAN_REVIEW\",review_agents:$json.quality_gate?.review_agents||[],reviewer:null,reviewer_role:null,decision:null,comment:null,instructions:\"Resubmit with human_decision and optional human_comment.\"};\nelse if(!allowed.includes(d)) review={required:true,status:\"INVALID_DECISION\",review_agents:$json.quality_gate?.review_agents||[],reviewer:$json.requested_by,reviewer_role:$json.requester_role,decision:d,comment:$json.human_comment||null,decided_at:new Date().toISOString()};\nelse review={required:true,status:\"COMPLETED\",review_agents:$json.quality_gate?.review_agents||[],reviewer:$json.requested_by,reviewer_role:$json.requester_role,decision:d,comment:$json.human_comment||null,decided_at:new Date().toISOString()};\nconst publish=qualityReady&&approved.includes(review.decision);\nreturn [{json:{...$json,human_review:review,publication_status:review.status===\"AWAITING_HUMAN_REVIEW\"?\"HELD_FOR_REVIEW\":publish?\"APPROVED_FOR_DASHBOARD\":\"NOT_PUBLISHED\",observability:[...($json.observability||[]),{component:\"human_review_queue\",event:review.status,status:review.decision||\"PENDING\",quality_ready:qualityReady,timestamp:new Date().toISOString()}]}}];"
+      },
+      "id": "af060a80-c3fc-4373-95f7-15926d751fc3",
+      "name": "12A. Human Review Queue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4336,
+        288
+      ],
+      "notesInFlow": true,
+      "notes": "Authorized reviewer approves, approves with conditions, rejects, or requests revision."
+    },
+    {
+      "parameters": {
+        "jsCode": "const canPublish=$json.quality_gate?.quality_threshold_met===true&&$json.aggregate?.partial_success===false&&$json.json_validation?.valid===true&&$json.quality_gate?.requires_human_review===false;\nreturn [{json:{...$json,human_review:{required:false,status:\"NOT_REQUIRED\",decision:canPublish?\"AUTO_PUBLISH\":\"BLOCKED\"},publication_status:canPublish?\"APPROVED_FOR_DASHBOARD\":\"NOT_PUBLISHED\",observability:[...($json.observability||[]),{component:\"publication\",event:canPublish?\"AUTO_PUBLISHED\":\"AUTO_PUBLISH_BLOCKED\",status:canPublish?\"SUCCESS\":\"FAILED\",timestamp:new Date().toISOString()}]}}];"
+      },
+      "id": "9a3478e1-1022-4d1b-8da2-38d67d188445",
+      "name": "12B. Publish Without Review",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4336,
+        496
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const results = $json.agent_results || [];\n\nconst agentInput = results.reduce(\n  (sum, result) => sum + Number(result.cost_of_insight?.input_tokens || 0),\n  0\n);\nconst agentCachedInput = results.reduce(\n  (sum, result) => sum + Number(result.cost_of_insight?.cached_input_tokens || 0),\n  0\n);\nconst agentOutput = results.reduce(\n  (sum, result) => sum + Number(result.cost_of_insight?.output_tokens || 0),\n  0\n);\nconst agentCost = results.reduce(\n  (sum, result) => sum + Number(result.cost_of_insight?.estimated_cost_usd || 0),\n  0\n);\n\nconst evaluationCost = Number(\n  $json.evaluation?.cost_of_evaluation?.estimated_cost_usd || 0\n);\nconst evaluationInput = Number(\n  $json.evaluation?.cost_of_evaluation?.input_tokens || 0\n);\nconst evaluationCachedInput = Number(\n  $json.evaluation?.cost_of_evaluation?.cached_input_tokens || 0\n);\nconst evaluationOutput = Number(\n  $json.evaluation?.cost_of_evaluation?.output_tokens || 0\n);\n\nconst totalInput = agentInput + evaluationInput;\nconst totalCachedInput = agentCachedInput + evaluationCachedInput;\nconst totalOutput = agentOutput + evaluationOutput;\nconst totalCost = agentCost + evaluationCost;\n\nconst now = new Date();\nconst events = $json.observability || [];\n\nreturn [{\n  json: {\n    ...$json,\n    observability_summary: {\n      run_id: $json.run_id,\n      events_recorded: events.length,\n      components: [...new Set(events.map(event => event.component).filter(Boolean))],\n      completed_agents: results.length,\n      grounded_agents: results.filter(\n        result => result.agent !== 'panel_load_balancer'\n      ).length,\n      deterministic_agents: results.filter(\n        result => result.agent === 'panel_load_balancer'\n      ).length,\n      model_calls: results.filter(\n        result => result.agent !== 'panel_load_balancer'\n      ).length + 1,\n      total_input_tokens: totalInput,\n      total_cached_input_tokens: totalCachedInput,\n      total_output_tokens: totalOutput,\n      total_tokens: totalInput + totalOutput,\n      estimated_agent_cost_usd: Number(agentCost.toFixed(6)),\n      estimated_evaluation_cost_usd: Number(evaluationCost.toFixed(6)),\n      estimated_total_openai_cost_usd: Number(totalCost.toFixed(6)),\n      total_run_latency_ms: Math.max(\n        0,\n        now.getTime() - new Date($json.started_at).getTime()\n      ),\n      retries: Number($json.json_validation?.repair_attempts || 0),\n      completed_at: now.toISOString()\n    }\n  }\n}];"
+      },
+      "id": "04f500f9-b0b9-4cc8-8a44-567e7a69ea13",
+      "name": "13. Observability",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        384
+      ],
+      "notesInFlow": true,
+      "notes": "Summarizes telemetry appended throughout ingestion, routing, RAG, LLM, agents, validation, evaluation, and review."
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst recs=[\n  \"Cache role-specific policy retrieval such as compensation bands and SLAs.\",\n  \"Keep deterministic metric calculations outside the LLM.\",\n  \"Execute independent insight agents in parallel.\",\n  \"Use a lower-cost reasoning model for low-risk agents and a stronger model for Offer Insights.\",\n  \"Compress retrieved context when token usage exceeds the configured threshold.\"\n];\nreturn [{json:{...$json,optimization:{applies_to:\"FUTURE_RUNS\",recommendations:recs}}}];\n"
+      },
+      "id": "ae020856-cde2-4058-a7ca-ea49013b42ee",
+      "name": "14. Optimization",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4784,
+        384
+      ],
+      "notesInFlow": true,
+      "notes": "Uses observability results to recommend routing, model, caching, and prompt improvements for future runs."
+    },
+    {
+      "parameters": {
+        "jsCode": "const results=Array.isArray($json.agent_results)?$json.agent_results:[];\nconst completed=$json.aggregate?.completed_agent_names||results.map(r=>r.agent);\nconst selected=$json.routing?.selected_agents||$json.requested_agents||[];\nconst quality=$json.quality_gate?.quality_threshold_met===true;\nconst complete=$json.aggregate?.partial_success===false;\nconst valid=$json.json_validation?.valid===true;\nconst decision=$json.human_review?.decision||$json.human_decision||null;\nconst approved=[\"APPROVED\",\"APPROVED_WITH_CONDITIONS\",\"AUTO_PUBLISH\"];\nconst review=$json.quality_gate?.requires_human_review===true;\nconst publish=quality&&complete&&valid&&(!review||approved.includes(decision))&&$json.publication_status===\"APPROVED_FOR_DASHBOARD\";\nlet status,message;\nif(!quality||!complete||!valid){status=\"FAILED_QUALITY_GATE\";message=\"Analysis completed but did not meet the publication quality threshold.\";}\nelse if(review&&!approved.includes(decision)){status=\"AWAITING_HUMAN_REVIEW\";message=\"Analysis completed and is awaiting authorized human review.\";}\nelse if(publish){status=\"COMPLETED\";message=\"Analysis completed and is ready for the Streamlit dashboard.\";}\nelse{status=\"COMPLETED_NOT_PUBLISHED\";message=\"Analysis completed but was not approved for publication.\";}\nreturn [{json:{success:quality&&complete&&valid,run_id:$json.run_id,status,message,streamlit_dashboard:{publish,run_summary:{requested_by:$json.requested_by,requester_role:$json.requester_role,role_filter:$json.role_filter,analysis_period:$json.analysis_period,valid_records:$json.ingestion?.valid_records??0,quarantined_records:$json.ingestion?.quarantined_records??0,selected_agents:selected,completed_agents:completed,missing_agents:$json.aggregate?.missing_agents||[],duplicate_agents:$json.aggregate?.duplicate_agents||[],partial_success:$json.aggregate?.partial_success??true},insights:results,evaluation:$json.evaluation||{},json_validation:$json.json_validation||{},quality_gate:$json.quality_gate||{},human_review:$json.human_review||{},observability:$json.observability_summary||{},optimization:$json.optimization||{}}}}];"
+      },
+      "id": "66216a21-3859-46fa-aec5-ed4465797725",
+      "name": "15. Streamlit Dashboard / Final Review",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5008,
+        384
+      ],
+      "notesInFlow": true,
+      "notes": "Displays insights, evidence, confidence, cost, latency, agent status, and review outcome for Hiring Manager / TA Lead."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "2570283e-db21-45fc-81b5-19a89ce7cb2c",
+      "name": "Respond to Streamlit",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        5232,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const agent = $json.active_agent;\n\nif (!agent) {\n  throw new Error(\"Prepare Pinecone Query did not receive active_agent.\");\n}\n\nconst queryByAgent = {\n  sourcing_quality: [\n    \"Retrieve approved recruiting source quality benchmarks, agency usage rules, source diversity safeguards, hire conversion guidance, quality-of-hire guidance, cost guidance, and decision-speed policies.\",\n    \"Focus on policies relevant to source conversion, offer acceptance, source quality, agency cost, and avoiding conclusions from small samples.\"\n  ].join(\" \"),\n\n  rejection_pattern: [\n    \"Retrieve approved rejection reason standards, fair hiring review policies, consistency requirements, job-related decision guidance, and human escalation requirements.\",\n    \"Focus on repeated rejection patterns, standardized reason capture, governance, fairness, and compliance review.\"\n  ].join(\" \"),\n\n  offer_insights: [\n    \"Retrieve approved compensation bands, offer approval service-level agreements, offer governance policies, decision-delay guidance, and authorization requirements.\",\n    \"Focus on compensation alignment, offer acceptance, decision timing, and required human approval.\"\n  ].join(\" \"),\n\n  pipeline_health: [\n    \"Retrieve approved pipeline health benchmarks, interview-stage service-level agreements, offer-stage aging guidance, stage conversion guidance, and bottleneck escalation rules.\",\n    \"Focus on stage volume, conversion, aging, interview delays, offer delays, and operational remediation.\"\n  ].join(\" \")\n};\n\nconst queryText = queryByAgent[agent] ||\n  `Retrieve approved TalentSphere policies, benchmarks, and service-level guidance for ${agent}.`;\n\nreturn {\n  json: {\n    ...$json,\n    rag_query: {\n      agent,\n      text: queryText,\n      top_k: 5,\n      namespace: \"talentsphere-dev\",\n      started_at: new Date().toISOString()\n    },\n    observability: [\n      ...($json.observability || []),\n      {\n        component: \"shared_rag\",\n        event: \"RETRIEVAL_STARTED\",\n        status: \"RUNNING\",\n        provider: \"PINECONE\",\n        embedding_model: \"llama-text-embed-v2\",\n        namespace: \"talentsphere-dev\",\n        agent,\n        timestamp: new Date().toISOString()\n      }\n    ]\n  }\n};"
+      },
+      "id": "08890d57-6a3f-4a56-bae4-a669107d174c",
+      "name": "6A. Prepare Pinecone Retrieval Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        496,
+        288
+      ],
+      "notesInFlow": true,
+      "notes": "Builds an agent-specific retrieval query and Pinecone metadata filter. Runs once for each grounded agent request."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://talentsphere-knowledge-6hfzi1w.svc.aped-4627-b74a.pinecone.io/records/namespaces/talentsphere-dev/search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "pineconeApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Pinecone-Api-Version",
+              "value": "2026-04"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  \"query\": {\n    \"inputs\": {\n      \"text\": $json.rag_query.text\n    },\n    \"top_k\": $json.rag_query.top_k,\n    \"filter\": {\n      \"agent\": {\n        \"$eq\": $json.active_agent\n      }\n    }\n  },\n  \"fields\": [\n    \"text\",\n    \"filename\",\n    \"document_id\",\n    \"agent\",\n    \"chunk_number\",\n    \"document_type\",\n    \"version\",\n    \"source\",\n    \"environment\"\n  ]\n} }}",
+        "options": {}
+      },
+      "id": "73cd2755-130e-45c9-84d0-f0da59f195fd",
+      "name": "6B. Pinecone Knowledge Base Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        720,
+        288
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "notesInFlow": true,
+      "credentials": {
+        "pineconeApi": {
+          "id": "mDXAhrOU0f4CkDM4",
+          "name": "Pinecone Production"
+        }
+      },
+      "notes": "Queries the integrated-embedding Pinecone index in namespace talentsphere-dev. Pinecone embeds query text with llama-text-embed-v2 and returns the top five agent-filtered policy chunks."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const source = $('6A. Prepare Pinecone Retrieval Query').item.json;\nconst response = $json || {};\n\nif (response.error) {\n  throw new Error(`Pinecone retrieval failed for ${source.active_agent}: ${response.error.message || JSON.stringify(response.error)}`);\n}\n\nconst hits = response.result?.hits || response.hits || [];\nconst documents = hits.map((hit, index) => {\n  const fields = hit.fields || hit.metadata || {};\n  return {\n    source_id: fields.document_id || hit._id || hit.id || `pinecone-hit-${index + 1}`,\n    title: fields.filename || fields.document_id || hit._id || `Retrieved policy ${index + 1}`,\n    statement: fields.text || fields.chunk_text || \"\",\n    score: Number(hit._score ?? hit.score ?? 0),\n    chunk_number: fields.chunk_number ?? null,\n    agent: fields.agent || source.active_agent,\n    document_type: fields.document_type || null,\n    version: fields.version || null,\n    source: fields.source || \"pinecone\",\n    environment: fields.environment || null\n  };\n}).filter(d => d.statement);\n\nconst startedAt = new Date(source.rag_query?.started_at || Date.now()).getTime();\nconst latencyMs = Math.max(0, Date.now() - startedAt);\n\nif (!documents.length) {\n  throw new Error(`Pinecone returned no grounded documents for ${source.active_agent}. Publication is blocked to prevent ungrounded analysis.`);\n}\n\nreturn {\n  json: {\n    ...source,\n    retrieval: {\n      retrieval_id: `RAG-${source.active_agent}-${Date.now()}`,\n      provider: \"PINECONE\",\n      embedding_model: \"llama-text-embed-v2\",\n      namespace: source.rag_query?.namespace || \"talentsphere-dev\",\n      agent: source.active_agent,\n      query: source.rag_query?.text,\n      documents,\n      document_count: documents.length,\n      top_score: documents.length ? Math.max(...documents.map(d => d.score || 0)) : 0,\n      usage: response.usage || null,\n      latency_ms: latencyMs,\n      retrieved_at: new Date().toISOString()\n    },\n    observability: [\n      ...(source.observability || []),\n      {\n        component: \"shared_rag\",\n        event: \"RETRIEVAL_COMPLETED\",\n        status: \"SUCCESS\",\n        provider: \"PINECONE\",\n        embedding_model: \"llama-text-embed-v2\",\n        namespace: source.rag_query?.namespace || \"talentsphere-dev\",\n        agent: source.active_agent,\n        documents_retrieved: documents.length,\n        top_score: documents.length ? Math.max(...documents.map(d => d.score || 0)) : 0,\n        latency_ms: latencyMs,\n        timestamp: new Date().toISOString()\n      }\n    ]\n  }\n};"
+      },
+      "id": "b037fbe5-3e2d-429a-ae8f-46f5716af766",
+      "name": "6C. Build Grounded Retrieval Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        944,
+        288
+      ],
+      "notesInFlow": true,
+      "notes": "Combines the Pinecone search response with the original agent request, normalizes retrieved chunks to the existing retrieval.documents contract, and blocks ungrounded execution when no documents are returned."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const original = $('7A. Build Grounded Reasoning Prompt').item.json;\nconst response = $json;\n\nconst outputText = (response.output || [])\n  .filter(item => item.type === 'message')\n  .flatMap(item => item.content || [])\n  .filter(content => content.type === 'output_text')\n  .map(content => content.text)\n  .join('')\n  .trim();\n\nif (!outputText) {\n  const refusal = (response.output || [])\n    .flatMap(item => item.content || [])\n    .find(content => content.type === 'refusal');\n\n  throw new Error(\n    refusal?.refusal ||\n    response.error?.message ||\n    `OpenAI returned no reasoning output for ${original.active_agent}.`\n  );\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(outputText);\n} catch (error) {\n  throw new Error(\n    `gpt-4o-mini returned invalid JSON for ${original.active_agent}: ${error.message}`\n  );\n}\n\nconst inputTokens = Number(response.usage?.input_tokens || 0);\nconst outputTokens = Number(response.usage?.output_tokens || 0);\nconst cachedInputTokens = Number(\n  response.usage?.input_tokens_details?.cached_tokens || 0\n);\n\n// Standard gpt-4o-mini PAYG reference rates.\n// Review these constants if OpenAI pricing changes.\nconst uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens);\nconst estimatedCostUsd =\n  (uncachedInputTokens * 0.15 / 1_000_000) +\n  (cachedInputTokens * 0.075 / 1_000_000) +\n  (outputTokens * 0.60 / 1_000_000);\n\nconst latencyMs = Math.max(\n  0,\n  Date.now() - Number(original.openai_reasoning_started_at_ms || Date.now())\n);\n\nreturn {\n  json: {\n    ...original,\n    openai_request: undefined,\n    llm_reasoning: {\n      model: response.model || 'gpt-4o-mini',\n      response_id: response.id || null,\n      prompt_version: 'grounded-agent-reasoning-v2',\n      metrics: parsed.metrics ?? {},\n      recommendation: String(parsed.recommendation || ''),\n      reasoning: String(parsed.reasoning || ''),\n      confidence: Math.max(0, Math.min(1, Number(parsed.confidence || 0))),\n      limitations: Array.isArray(parsed.limitations) ? parsed.limitations : [],\n      requires_human_review: Boolean(parsed.requires_human_review),\n      human_review_reason: String(parsed.human_review_reason || ''),\n      cost_of_insight: {\n        input_tokens: inputTokens,\n        cached_input_tokens: cachedInputTokens,\n        output_tokens: outputTokens,\n        total_tokens: Number(response.usage?.total_tokens || inputTokens + outputTokens),\n        latency_ms: latencyMs,\n        estimated_cost_usd: Number(estimatedCostUsd.toFixed(6))\n      },\n      generated_at: new Date().toISOString()\n    },\n    observability: [\n      ...(original.observability || []),\n      {\n        component: 'shared_reasoning_llm',\n        event: 'REASONING_COMPLETED',\n        status: 'SUCCESS',\n        model: response.model || 'gpt-4o-mini',\n        response_id: response.id || null,\n        prompt_version: 'grounded-agent-reasoning-v2',\n        input_tokens: inputTokens,\n        cached_input_tokens: cachedInputTokens,\n        output_tokens: outputTokens,\n        total_tokens: Number(response.usage?.total_tokens || inputTokens + outputTokens),\n        latency_ms: latencyMs,\n        estimated_cost_usd: Number(estimatedCostUsd.toFixed(6)),\n        timestamp: new Date().toISOString()\n      }\n    ]\n  }\n};"
+      },
+      "id": "29f95dc9-fd82-4d37-a142-8edce906e9c8",
+      "name": "7C. Parse OpenAI Reasoning JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        288
+      ],
+      "notesInFlow": true,
+      "notes": "Parses GPT-4o-mini JSON, restores the original workflow item, and records actual token usage, latency, response ID, and estimated cost."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const original = $('11A. Build Evaluation Prompt').item.json;\nconst response = $json;\n\nconst outputText = (response.output || [])\n  .filter(item => item.type === 'message')\n  .flatMap(item => item.content || [])\n  .filter(content => content.type === 'output_text')\n  .map(content => content.text)\n  .join('')\n  .trim();\n\nif (!outputText) {\n  const refusal = (response.output || [])\n    .flatMap(item => item.content || [])\n    .find(content => content.type === 'refusal');\n\n  throw new Error(\n    refusal?.refusal ||\n    response.error?.message ||\n    'OpenAI evaluation returned no output.'\n  );\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(outputText);\n} catch (error) {\n  throw new Error(`GPT-4o-mini judge returned invalid JSON: ${error.message}`);\n}\n\nconst validDecisions = new Set([\n  'PASS',\n  'PASS_WITH_HUMAN_REVIEW',\n  'REVISE',\n  'FAIL'\n]);\n\nconst expectedAgents = new Set(\n  (original.agent_results || []).map(result => result.agent)\n);\n\nconst evaluations = (Array.isArray(parsed.results) ? parsed.results : [])\n  .filter(result => expectedAgents.has(result.agent))\n  .map(result => ({\n    agent: result.agent,\n    grounding_score: Math.max(0, Math.min(1, Number(result.grounding_score || 0))),\n    actionability_score: Math.max(0, Math.min(1, Number(result.actionability_score || 0))),\n    hallucination_risk: Math.max(0, Math.min(1, Number(result.hallucination_risk ?? 1))),\n    safety_score: Math.max(0, Math.min(1, Number(result.safety_score || 0))),\n    decision: validDecisions.has(String(result.decision).toUpperCase())\n      ? String(result.decision).toUpperCase()\n      : 'REVISE',\n    rationale: String(result.rationale || '')\n  }));\n\nconst returnedAgents = new Set(evaluations.map(result => result.agent));\nfor (const agent of expectedAgents) {\n  if (!returnedAgents.has(agent)) {\n    evaluations.push({\n      agent,\n      grounding_score: 0,\n      actionability_score: 0,\n      hallucination_risk: 1,\n      safety_score: 0,\n      decision: 'FAIL',\n      rationale: 'The evaluator did not return a result for this expected agent.'\n    });\n  }\n}\n\nconst validationFailed = original.json_validation?.valid !== true;\nconst hasFailure = evaluations.some(result =>\n  result.decision === 'FAIL' || result.decision === 'REVISE'\n);\nconst hasReview = evaluations.some(result =>\n  result.decision === 'PASS_WITH_HUMAN_REVIEW'\n);\n\nconst status = validationFailed\n  ? 'FAILED'\n  : hasFailure\n    ? 'REVISION_REQUIRED'\n    : hasReview\n      ? 'PASS_WITH_HUMAN_REVIEW'\n      : 'PASS';\n\nconst inputTokens = Number(response.usage?.input_tokens || 0);\nconst outputTokens = Number(response.usage?.output_tokens || 0);\nconst cachedInputTokens = Number(\n  response.usage?.input_tokens_details?.cached_tokens || 0\n);\nconst uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens);\nconst estimatedCostUsd =\n  (uncachedInputTokens * 0.15 / 1_000_000) +\n  (cachedInputTokens * 0.075 / 1_000_000) +\n  (outputTokens * 0.60 / 1_000_000);\n\nconst latencyMs = Math.max(\n  0,\n  Date.now() - Number(original.openai_evaluation_started_at_ms || Date.now())\n);\n\nreturn {\n  json: {\n    ...original,\n    openai_evaluation_request: undefined,\n    evaluation: {\n      evaluator: response.model || 'gpt-4o-mini',\n      response_id: response.id || null,\n      prompt_version: 'llm-judge-v2',\n      status,\n      results: evaluations,\n      overall_summary: String(parsed.overall_summary || ''),\n      cost_of_evaluation: {\n        input_tokens: inputTokens,\n        cached_input_tokens: cachedInputTokens,\n        output_tokens: outputTokens,\n        total_tokens: Number(response.usage?.total_tokens || inputTokens + outputTokens),\n        latency_ms: latencyMs,\n        estimated_cost_usd: Number(estimatedCostUsd.toFixed(6))\n      }\n    },\n    observability: [\n      ...(original.observability || []),\n      {\n        component: 'evaluation_agent',\n        event: 'EVALUATION_COMPLETED',\n        status: status === 'FAILED' ? 'FAILED' : 'SUCCESS',\n        model: response.model || 'gpt-4o-mini',\n        response_id: response.id || null,\n        prompt_version: 'llm-judge-v2',\n        input_tokens: inputTokens,\n        cached_input_tokens: cachedInputTokens,\n        output_tokens: outputTokens,\n        total_tokens: Number(response.usage?.total_tokens || inputTokens + outputTokens),\n        latency_ms: latencyMs,\n        estimated_cost_usd: Number(estimatedCostUsd.toFixed(6)),\n        timestamp: new Date().toISOString()\n      }\n    ]\n  }\n};"
+      },
+      "id": "392207f0-0b48-4339-9cbb-0dfa7b44d42b",
+      "name": "11C. Parse OpenAI Evaluation JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3664,
+        384
+      ],
+      "notesInFlow": true,
+      "notes": "Parses and normalizes GPT-4o-mini judge results, fails closed when an expected agent is missing, and records usage, latency, and estimated cost."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/responses",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.openai_request }}",
+        "options": {}
+      },
+      "id": "cb7c9386-ddb3-4002-8c91-85173df5549f",
+      "name": "7B. OpenAI GPT-4o-mini Reasoning",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1392,
+        288
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "notesInFlow": true,
+      "credentials": {
+        "openAiApi": {
+          "id": "87mIzOXuGP8hwyjg",
+          "name": "OpenAI Production"
+        }
+      },
+      "notes": "Calls the OpenAI Responses API with GPT-4.1. After import, select your OpenAI credential in this node if n8n does not match it automatically."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/responses",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.openai_evaluation_request }}",
+        "options": {}
+      },
+      "id": "01658177-7704-4747-9960-9c7d2e5340cd",
+      "name": "11B. OpenAI GPT-4o-mini Evaluation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        3440,
+        384
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "notesInFlow": true,
+      "credentials": {
+        "openAiApi": {
+          "id": "87mIzOXuGP8hwyjg",
+          "name": "OpenAI Production"
+        }
+      },
+      "notes": "Calls GPT-4.1 as an independent judge. After import, select your OpenAI credential in this node if n8n does not match it automatically."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "1. Streamlit Intake / Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "2. Hiring Data Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. Hiring Data Sources": {
+      "main": [
+        [
+          {
+            "node": "3. Ingest, Validate & Clean",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. Ingest, Validate & Clean": {
+      "main": [
+        [
+          {
+            "node": "4. Routing Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4. Routing Agent": {
+      "main": [
+        [
+          {
+            "node": "5A. Sourcing Quality Agent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "5B. Rejection Pattern Agent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "5C. Offer Insights Agent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "5D. Pipeline Health Agent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "5E. Panel Load Balancer — Direct Execution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "5A. Sourcing Quality Agent": {
+      "main": [
+        [
+          {
+            "node": "5F. Merge Four Grounded Agent Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "5B. Rejection Pattern Agent": {
+      "main": [
+        [
+          {
+            "node": "5F. Merge Four Grounded Agent Requests",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "5C. Offer Insights Agent": {
+      "main": [
+        [
+          {
+            "node": "5F. Merge Four Grounded Agent Requests",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "5D. Pipeline Health Agent": {
+      "main": [
+        [
+          {
+            "node": "5F. Merge Four Grounded Agent Requests",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "5F. Merge Four Grounded Agent Requests": {
+      "main": [
+        [
+          {
+            "node": "6A. Prepare Pinecone Retrieval Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "8. Standardized Agent JSON Output": {
+      "main": [
+        [
+          {
+            "node": "9. Aggregate Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "5E. Panel Load Balancer — Direct Execution": {
+      "main": [
+        [
+          {
+            "node": "7D. Merge Four Grounded + One Direct Agent",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "9. Aggregate Agent": {
+      "main": [
+        [
+          {
+            "node": "10. JSON Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10. JSON Validation": {
+      "main": [
+        [
+          {
+            "node": "Valid Shared JSON Contract?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid Shared JSON Contract?": {
+      "main": [
+        [
+          {
+            "node": "11A. Build Evaluation Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "10A. JSON Repair — One Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10A. JSON Repair — One Attempt": {
+      "main": [
+        [
+          {
+            "node": "10B. Revalidate Repaired JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10B. Revalidate Repaired JSON": {
+      "main": [
+        [
+          {
+            "node": "11A. Build Evaluation Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12. Quality Threshold Gate": {
+      "main": [
+        [
+          {
+            "node": "Human Review Required?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Human Review Required?": {
+      "main": [
+        [
+          {
+            "node": "12A. Human Review Queue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "12B. Publish Without Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12A. Human Review Queue": {
+      "main": [
+        [
+          {
+            "node": "13. Observability",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12B. Publish Without Review": {
+      "main": [
+        [
+          {
+            "node": "13. Observability",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "13. Observability": {
+      "main": [
+        [
+          {
+            "node": "14. Optimization",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "14. Optimization": {
+      "main": [
+        [
+          {
+            "node": "15. Streamlit Dashboard / Final Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "15. Streamlit Dashboard / Final Review": {
+      "main": [
+        [
+          {
+            "node": "Respond to Streamlit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "6A. Prepare Pinecone Retrieval Query": {
+      "main": [
+        [
+          {
+            "node": "6B. Pinecone Knowledge Base Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "6B. Pinecone Knowledge Base Search": {
+      "main": [
+        [
+          {
+            "node": "6C. Build Grounded Retrieval Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "6C. Build Grounded Retrieval Context": {
+      "main": [
+        [
+          {
+            "node": "7A. Build Grounded Reasoning Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7A. Build Grounded Reasoning Prompt": {
+      "main": [
+        [
+          {
+            "node": "7B. OpenAI GPT-4o-mini Reasoning",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7C. Parse OpenAI Reasoning JSON": {
+      "main": [
+        [
+          {
+            "node": "7D. Merge Four Grounded + One Direct Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7D. Merge Four Grounded + One Direct Agent": {
+      "main": [
+        [
+          {
+            "node": "8. Standardized Agent JSON Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11A. Build Evaluation Prompt": {
+      "main": [
+        [
+          {
+            "node": "11B. OpenAI GPT-4o-mini Evaluation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11C. Parse OpenAI Evaluation JSON": {
+      "main": [
+        [
+          {
+            "node": "12. Quality Threshold Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7B. OpenAI GPT-4o-mini Reasoning": {
+      "main": [
+        [
+          {
+            "node": "7C. Parse OpenAI Reasoning JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11B. OpenAI GPT-4o-mini Evaluation": {
+      "main": [
+        [
+          {
+            "node": "11C. Parse OpenAI Evaluation JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "27102323-5c7e-4b9c-b6da-0c0048dcdbed",
+  "meta": {
+    "instanceId": "f6bfdc2311fd55a80b37111f5684a5513a05387ab8cfe6f4a4f072fb8f964eb6"
+  },
+  "nodeGroups": [],
+  "id": "KwwmhcogcJ6mmyw6",
+  "tags": []
+}
