@@ -24,41 +24,23 @@ Streamlit
 Workflow
 
 Hiring Data
-
 ↓
-
 Validation
-
 ↓
-
 Routing
-
 ↓
-
 4 AI Agents
-
 ↓
-
 Panel Load Balancer
-
 ↓
-
 Aggregation
-
 ↓
-
 Validation
-
 ↓
-
 Evaluation
-
 ↓
-
 Human Review
-
 ↓
-
 Dashboard
 
 Key Capabilities
